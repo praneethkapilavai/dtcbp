@@ -6,10 +6,19 @@ import time
 import pandas as pd
 from collections import OrderedDict
 import copy
+import winsound
+import threading
 
 # ================================
 # 1. HELPER FUNCTIONS
 # ================================
+is_beeping = False
+
+def continuous_beep():
+    global is_beeping
+    while is_beeping:
+        winsound.Beep(1500, 250)
+
 def eye_aspect_ratio(eye):
     A = distance.euclidean(eye[1], eye[5])
     B = distance.euclidean(eye[2], eye[4])
@@ -18,10 +27,12 @@ def eye_aspect_ratio(eye):
     return EAR
 
 def lips_aspect_ratio(lips):
-    A = distance.euclidean(lips[4], lips[8])
-    B = distance.euclidean(lips[2], lips[10])
-    C = distance.euclidean(lips[0], lips[6])
-    LAR = (A + B + C) / 3.0
+    width = distance.euclidean(lips[0], lips[6])
+    A = distance.euclidean(lips[13], lips[19]) 
+    B = distance.euclidean(lips[14], lips[18]) 
+    C = distance.euclidean(lips[15], lips[17]) 
+    if width == 0: width = 0.1
+    LAR = (A + B + C) / (3.0 * width)
     return LAR
 
 def get_head_pose(shape, size):
@@ -60,18 +71,18 @@ def get_head_pose(shape, size):
     # Using Rodriguez to get rotation matrix
     rmat, jac = cv2.Rodrigues(rotation_vector)
     
-    # Get the angles
+    # Get the angles (Returned in degrees directly)
     angles, mtxR, mtxQ, Qx, Qy, Qz = cv2.RQDecomp3x3(rmat)
-    x = angles[0] * 360 # Pitch (Up/Down)
-    y = angles[1] * 360 # Yaw (Left/Right)
-    z = angles[2] * 360 # Roll
+    x = angles[0] # Pitch (Up/Down)
+    y = angles[1] # Yaw (Left/Right)
+    z = angles[2] # Roll
     
-    status = "Focused"
-    if y < -10:
-        status = "Looking Right"
-    elif y > 10:
+    status = "Undistracted"
+    if y < -30:
         status = "Looking Left"
-    elif x < -10:
+    elif y > 30:
+        status = "Looking Right"
+    elif x < -25:
         status = "Looking Down"
     
     return status
@@ -166,6 +177,8 @@ def main():
 
     print("[INFO] Starting Classroom Engagement Monitor...")
     
+    global is_beeping
+    
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -177,6 +190,8 @@ def main():
         # 1. Detect multiple faces
         faces = hog_face_detector(gray)
         rects = []
+        
+        anyone_sleeping = False
         
         for face in faces:
             # Map for tracker
@@ -192,7 +207,8 @@ def main():
                     'sleep_frames': 0, 
                     'talk_frames': 0, 
                     'distracted_frames': 0, 
-                    'focus_frames': 0
+                    'focus_frames': 0,
+                    'lar_history': []
                 }
                 
             # Find closest face rect to this centroid
@@ -222,22 +238,36 @@ def main():
                 size = frame.shape
                 focus_status = get_head_pose(face_landmarks, size)
                 
+                # Lip Sync (Dynamic Talking Detection)
+                lar_hist = session_data[objectID]['lar_history']
+                lar_hist.append(lar)
+                if len(lar_hist) > 15:
+                    lar_hist.pop(0)
+                
+                is_talking = False
+                if len(lar_hist) == 15:
+                    lar_var = max(lar_hist) - min(lar_hist)
+                    # Balanced sensitivity for minor lip movement
+                    if lar_var > 0.035 and max(lar_hist) > 0.18:
+                        is_talking = True
+                
                 # Update Session Data
                 if ear < EAR_THRESH:
                     session_data[objectID]['sleep_frames'] += 1
                     status_text = "Sleeping!"
                     color = (0, 0, 255)
-                elif lar > LAR_THRESH:
+                    anyone_sleeping = True
+                elif is_talking:
                     session_data[objectID]['talk_frames'] += 1
                     status_text = "Talking"
                     color = (0, 165, 255) # Orange
-                elif focus_status != "Focused":
+                elif focus_status != "Undistracted":
                     session_data[objectID]['distracted_frames'] += 1
                     status_text = focus_status
                     color = (0, 255, 255) # Yellow
                 else:
                     session_data[objectID]['focus_frames'] += 1
-                    status_text = "Focused"
+                    status_text = "Undistracted"
                     color = (0, 255, 0) # Green
                 
                 # Draw on frame
@@ -245,6 +275,12 @@ def main():
                 cv2.putText(frame, f"Seat {objectID}: {status_text}", (face.left(), face.top() - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
                             
+        if anyone_sleeping and not is_beeping:
+            is_beeping = True
+            threading.Thread(target=continuous_beep, daemon=True).start()
+        elif not anyone_sleeping and is_beeping:
+            is_beeping = False
+            
         # Info panel
         cv2.putText(frame, "Press 'Esc' to exit and generate report.", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
@@ -252,6 +288,7 @@ def main():
 
         key = cv2.waitKey(1)
         if key == 27: # Esc key
+            is_beeping = False # Turn off beep if exiting
             break
             
     cap.release()
